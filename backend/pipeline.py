@@ -5,116 +5,181 @@ Orchestrates data collection from all sources into MongoDB
 
 import json
 import logging
-import sys
+import time
 from pathlib import Path
 from datetime import datetime
 
-from models.db import projects, vesting_streams
-from collectors.sablier_collector import fetch_streams_by_token, normalize_stream
+from models.db import get_db, projects, vesting_streams
+from collectors.sablier_collector import fetch_streams_by_token, normalize_stream as norm_sablier
+from collectors.blockscout_collector import (
+    find_vesting_contracts_from_token,
+    get_address_info as blockscout_addr_info,
+)
+from collectors.ethplorer_collector import get_top_holders, get_token_info, normalize_holder
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 SEEDS_PATH = Path(__file__).parent.parent / "data" / "seeds" / "projects.json"
 
+CHAIN_ID_MAP = {
+    "ethereum": "1",
+    "arbitrum": "42161",
+    "optimism": "10",
+    "base":     "8453",
+    "polygon":  "137",
+}
+
 
 def seed_projects():
-    """프로젝트 시드 데이터를 MongoDB에 로드"""
     col = projects()
     with open(SEEDS_PATH) as f:
         project_list = json.load(f)
 
-    inserted, updated = 0, 0
+    inserted = 0
     for p in project_list:
         p["created_at"] = datetime.utcnow()
-        result = col.update_one(
-            {"slug": p["slug"]},
-            {"$setOnInsert": p},
-            upsert=True,
-        )
+        result = col.update_one({"slug": p["slug"]}, {"$setOnInsert": p}, upsert=True)
         if result.upserted_id:
             inserted += 1
-        else:
-            updated += 1
 
-    logger.info(f"Projects seeded: {inserted} inserted, {updated} already existed")
+    logger.info(f"Projects: {inserted} inserted, {len(project_list)-inserted} already existed")
     return project_list
 
 
-def collect_sablier_for_project(project: dict) -> int:
-    """단일 프로젝트의 Sablier 베스팅 스트림 수집"""
+def collect_sablier(project: dict) -> int:
     token_addr = project.get("token_address")
     chain = project.get("chain", "ethereum")
-
-    if not token_addr or chain not in ("ethereum", "arbitrum", "optimism", "base", "polygon"):
+    chain_id = CHAIN_ID_MAP.get(chain)
+    if not token_addr or not chain_id:
         return 0
 
-    # Sablier chain_id 매핑
-    chain_id_map = {
-        "ethereum": "1",
-        "arbitrum": "42161",
-        "optimism": "10",
-        "base": "8453",
-        "polygon": "137",
-    }
-    chain_id = chain_id_map.get(chain)
-
-    logger.info(f"Fetching Sablier streams for {project['name']} ({project['token_symbol']}) on {chain}")
     streams = fetch_streams_by_token(token_addr, chain_id=chain_id, limit=200)
-
     if not streams:
-        logger.info(f"  → No streams found")
         return 0
 
     col = vesting_streams()
     saved = 0
-    for stream in streams:
-        doc = normalize_stream(stream)
+    for s in streams:
+        doc = norm_sablier(s)
         doc["project_slug"] = project["slug"]
         doc["project_name"] = project["name"]
+        col.update_one({"stream_id": doc["stream_id"]}, {"$set": doc}, upsert=True)
+        saved += 1
 
+    logger.info(f"  [Sablier] {project['name']}: {saved} streams")
+    return saved
+
+
+def collect_top_holders(project: dict) -> int:
+    token_addr = project.get("token_address")
+    if not token_addr or project.get("chain") not in ("ethereum",):
+        return 0
+
+    holders = get_top_holders(token_addr, limit=50)
+    if not holders:
+        return 0
+
+    col = get_db()["top_holders"]
+    saved = 0
+    for h in holders:
+        doc = normalize_holder(h, token_addr, project.get("token_symbol", ""), project["slug"])
         col.update_one(
-            {"stream_id": doc["stream_id"]},
+            {"address": doc["address"], "token_address": doc["token_address"]},
             {"$set": doc},
             upsert=True,
         )
         saved += 1
 
-    logger.info(f"  → Saved {saved} streams")
+    logger.info(f"  [Ethplorer] {project['name']}: {saved} top holders")
+    time.sleep(0.3)  # rate limit 방지
     return saved
 
 
-def run_full_pipeline():
+def collect_blockscout_contracts(project: dict) -> int:
+    token_addr = project.get("token_address")
+    chain = project.get("chain", "ethereum")
+    if not token_addr or chain not in ("ethereum", "optimism", "arbitrum", "base"):
+        return 0
+
+    contracts = find_vesting_contracts_from_token(chain, token_addr)
+    if not contracts:
+        return 0
+
+    col = get_db()["vesting_contract_candidates"]
+    saved = 0
+    for c in contracts:
+        # 검증된 컨트랙트 또는 태그 있는 것만
+        if c.get("is_verified") or c.get("tags"):
+            doc = {
+                **c,
+                "project_slug": project["slug"],
+                "project_name": project["name"],
+                "token_address": token_addr,
+                "chain": chain,
+                "fetched_at": datetime.utcnow(),
+            }
+            col.update_one(
+                {"address": c["address"], "project_slug": project["slug"]},
+                {"$set": doc},
+                upsert=True,
+            )
+            saved += 1
+
+    if saved:
+        logger.info(f"  [Blockscout] {project['name']}: {saved} contract candidates")
+    return saved
+
+
+def run_full_pipeline(sources=("sablier", "ethplorer", "blockscout")):
     logger.info("=== Tiger Data Portal Pipeline START ===")
 
-    # 1. 시드 데이터 로드
     project_list = seed_projects()
 
-    # 2. ETH 기반 프로젝트 Sablier 수집
-    total_streams = 0
-    ethereum_projects = [p for p in project_list if p.get("token_address") and p.get("chain") in ("ethereum", "arbitrum", "optimism", "base")]
+    # EVM 프로젝트만 필터
+    evm = [p for p in project_list if p.get("token_address") and
+           p.get("chain") in ("ethereum", "arbitrum", "optimism", "base", "polygon")]
+    eth_only = [p for p in evm if p.get("chain") == "ethereum"]
 
-    logger.info(f"Collecting Sablier data for {len(ethereum_projects)} EVM projects...")
-    for project in ethereum_projects:
-        count = collect_sablier_for_project(project)
-        total_streams += count
+    totals = {"sablier": 0, "ethplorer": 0, "blockscout": 0}
 
-    logger.info(f"=== Pipeline DONE | Total streams collected: {total_streams} ===")
+    for project in evm:
+        logger.info(f"Processing: {project['name']} ({project['chain']})")
 
-    # 3. 요약 출력
-    db_projects = projects()
-    db_streams = vesting_streams()
-    print(f"\n📊 현재 DB 상태:")
-    print(f"  Projects: {db_projects.count_documents({})}")
-    print(f"  Vesting Streams: {db_streams.count_documents({})}")
+        if "sablier" in sources:
+            totals["sablier"] += collect_sablier(project)
 
-    if total_streams > 0:
-        print(f"\n🔍 상위 스트림 (금액 기준):")
-        top = db_streams.find(
-            {}, {"project_name": 1, "token_symbol": 1, "deposit_amount": 1, "recipient": 1, "start_time": 1, "end_time": 1}
-        ).sort("deposit_amount", -1).limit(10)
-        for s in top:
-            print(f"  [{s['project_name']}] {s.get('deposit_amount', 0):,.0f} {s.get('token_symbol')} → {s.get('recipient', '')[:12]}... ({s.get('start_time', '?')} ~ {s.get('end_time', '?')})")
+        if "ethplorer" in sources and project in eth_only:
+            totals["ethplorer"] += collect_top_holders(project)
+            time.sleep(0.5)
+
+        if "blockscout" in sources:
+            totals["blockscout"] += collect_blockscout_contracts(project)
+            time.sleep(0.3)
+
+    logger.info(f"=== Pipeline DONE ===")
+
+    # 요약
+    db = get_db()
+    print(f"\n📊 DB 현황:")
+    print(f"  Projects:             {db['projects'].count_documents({})}")
+    print(f"  Vesting Streams:      {db['vesting_streams'].count_documents({})}")
+    print(f"  Top Holders:          {db['top_holders'].count_documents({})}")
+    print(f"  Contract Candidates:  {db['vesting_contract_candidates'].count_documents({})}")
+    print(f"\n✅ 이번 실행 수집:")
+    print(f"  Sablier streams:     {totals['sablier']}")
+    print(f"  Ethplorer holders:   {totals['ethplorer']}")
+    print(f"  Blockscout contracts:{totals['blockscout']}")
+
+    # Top 인사이더 후보
+    print(f"\n🔍 주요 인사이더 후보 (보유량 상위):")
+    top = db["top_holders"].find(
+        {"is_insider_candidate": True},
+        {"project_slug": 1, "address": 1, "share_percent": 1, "token_symbol": 1, "balance": 1}
+    ).sort("share_percent", -1).limit(10)
+    for h in top:
+        print(f"  [{h.get('project_slug','?')}] {h.get('address','')[:14]}... "
+              f"{h.get('share_percent',0):.1f}% ({h.get('balance',0)/1e18:.0f} {h.get('token_symbol','')})")
 
 
 if __name__ == "__main__":
