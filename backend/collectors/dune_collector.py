@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-API_KEY = os.getenv("DUNE_API_KEY", "")
+API_KEY = os.getenv("DUNE_API_KEY", "4oe5D6KBZ33qv1cAjy0egwSDX31OkoWf")
 BASE_URL = "https://api.dune.com/api/v1"
 HEADERS = {"X-Dune-API-Key": API_KEY, "Content-Type": "application/json"}
 

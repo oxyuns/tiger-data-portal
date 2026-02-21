@@ -126,6 +126,62 @@ def wallet_info(address: str):
     }
 
 
+@app.get("/vesting-contracts")
+def list_vesting_contracts(
+    project: str = None,
+    classification: str = None,
+    verified_only: bool = True,
+    limit: int = Query(default=50, le=200),
+):
+    """검증된 베스팅 컨트랙트 목록"""
+    query = {}
+    if verified_only:
+        query["is_vesting"] = True
+    if project:
+        query["project_slug"] = project
+    if classification:
+        query["classification"] = classification
+
+    docs = list(
+        get_db()["verified_vesting_contracts"]
+        .find(query, {"_id": 0})
+        .sort("total_distributed", -1)
+        .limit(limit)
+    )
+    return {"total": len(docs), "contracts": docs}
+
+
+@app.get("/vesting-contracts/{address}")
+def get_vesting_contract(address: str):
+    """특정 베스팅 컨트랙트 상세"""
+    doc = get_db()["verified_vesting_contracts"].find_one(
+        {"address": address.lower()}, {"_id": 0}
+    )
+    return doc or {"error": "not found"}
+
+
+@app.get("/insider-candidates")
+def insider_candidates(
+    project: str = None,
+    min_share: float = 0.5,
+    limit: int = Query(default=50, le=200),
+):
+    """내부자 후보 지갑 (대량 보유자)"""
+    query = {"is_insider_candidate": True}
+    if project:
+        query["project_slug"] = project
+    if min_share:
+        query["share_percent"] = {"$gte": min_share}
+
+    docs = list(
+        get_db()["top_holders"]
+        .find(query, {"_id": 0})
+        .sort("share_percent", -1)
+        .limit(limit)
+    )
+    return {"total": len(docs), "candidates": docs}
+
+
 @app.get("/stats")
 def stats():
     """전체 통계"""
